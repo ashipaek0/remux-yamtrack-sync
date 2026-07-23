@@ -95,22 +95,6 @@ Add to your Yamtrack `docker-compose.yml`:
 | `BIND` | No | `0.0.0.0:8001` | Listen address |
 | `DB_PATH` | No | `/yamtrack/db/db.sqlite3` | Path to Yamtrack SQLite (read-only) |
 
-## Finding the Yamtrack token
+## Getting your credentials
 
-```bash
-docker exec yamtrack python3 -c "
-import os, sys
-sys.path.insert(0, '/yamtrack')
-os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'
-import django; django.setup()
-from users.models import User
-for u in User.objects.all():
-    print(f'{u.username}: token={u.token}')
-"
-```
-
-## Finding the Remux API key
-
-```bash
-sqlite3 ./remux/data/db.sqlite "SELECT access_token FROM api_keys;"
-```
+Both the **Yamtrack token** and **Remux API key** can be found in their respective web UIs — no command-line hunting needed.
