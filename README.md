@@ -40,7 +40,7 @@ Add to your Yamtrack `docker-compose.yml`:
 
 ```yaml
   yamtrack-sync:
-    image: ashipaek0/yamtrack-sync:latest
+    image: irunmole/yamtrack-sync:latest
     environment:
       BIND: "0.0.0.0:8001"
       DB_PATH: /yamtrack/db/db.sqlite3
@@ -55,7 +55,7 @@ Add to your Yamtrack `docker-compose.yml`:
 
 ```yaml
   remux-bridge:
-    image: ashipaek0/remux-bridge:latest
+    image: irunmole/remux-bridge:latest
     environment:
       REMUX_URL: http://remux:3000
       REMUX_API_KEY: <remux-api-key>
