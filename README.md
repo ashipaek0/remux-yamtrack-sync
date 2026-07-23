@@ -97,4 +97,4 @@ Add to your Yamtrack `docker-compose.yml`:
 
 ## Getting your credentials
 
-Both the **Yamtrack token** and **Remux API key** can be found in their respective web UIs — no command-line hunting needed.
+Both the **Yamtrack token** and **Remux API key** can be found in their respective web UIs.
