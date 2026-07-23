@@ -60,7 +60,7 @@ Add to your Yamtrack `docker-compose.yml`:
       REMUX_URL: http://remux:3000
       REMUX_API_KEY: <remux-api-key>
       REMUX_DB_PATH: /remux-db/db.sqlite
-      YAMTRACK_URL: https://track.yourdomain.com
+      YAMTRACK_URL: <your_yamtrack_url>
       YAMTRACK_TOKEN: <yamtrack-user-token>
       YAMTRACK_SYNC_URL: http://yamtrack-sync:8001
       FORWARD_INTERVAL: "30"
