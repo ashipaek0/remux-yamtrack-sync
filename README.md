@@ -9,29 +9,6 @@ Two components:
 | **Bridge** (`bridge/`) | Alongside Remux | Polls Remux API → posts Jellyfin webhook to Yamtrack (forward). Polls sync-server → writes Remux SQLite (reverse). |
 | **Sync-server** (`sync-server/`) | Alongside Yamtrack | Read-only HTTP shim over Yamtrack's SQLite. Exposes `GET /changes` for the bridge to poll. |
 
-## Architecture
-
-```
-┌──────────────┐     forward (every 30s)     ┌──────────────┐
-│   Remux DB   │ ←────── POST webhook ──────→│   Yamtrack   │
-│   (SQLite)   │                              │  (Django)    │
-└──────┬───────┘                              └──────┬───────┘
-       │                                             │
-       │  reverse (every 60s)                        │
-       │ ←──── SQLite write ─────┐                   │
-       │                         │                   │
-       │               ┌────────┴────────┐           │
-       │               │  Bridge (Python) │           │
-       │               └────────┬────────┘           │
-       │                         │                   │
-       │                  GET /changes?token=...&since=...
-       │                         │                   │
-       │               ┌────────┴────────┐           │
-       │               │  Sync-server    │───────────┘
-       │               │  (Python HTTP)  │  reads SQLite
-       │               └─────────────────┘
-```
-
 ## Quick Start
 
 ### Sync-server (on Yamtrack host)
