@@ -121,7 +121,7 @@ def build_payload(item: dict) -> dict:
         "UserData": {
             "Played":           udata.get("Played", False),
             "PlayCount":        udata.get("PlayCount", 0),
-            "PlaybackPosition": udata.get("PlaybackPosition", 0),
+            "PlaybackPositionTicks": udata.get("PlaybackPositionTicks", 0),
             "LastPlayedDate":   udata.get("LastPlayedDate"),
         },
     }
@@ -268,24 +268,25 @@ def update_remux_play_state(items: list[dict]) -> str | None:
                 continue
 
             row = conn.execute(
-                "SELECT id FROM media WHERE external_ids LIKE ? LIMIT 1",
+                "SELECT id, runtime FROM media WHERE external_ids LIKE ? LIMIT 1",
                 (f'%tmdb":{media_id}%',)
             ).fetchone()
             if not row:
                 row = conn.execute(
-                    "SELECT id FROM media WHERE external_ids LIKE ? LIMIT 1",
+                    "SELECT id, runtime FROM media WHERE external_ids LIKE ? LIMIT 1",
                     (f'%"imdb":"tt{media_id}%',)
                 ).fetchone()
             if not row:
                 # Try with 'tmdb' as integer in JSON (e.g. {"tmdb":1315772})
                 row = conn.execute(
-                    "SELECT id FROM media WHERE json_extract(external_ids, '$.tmdb') = ? LIMIT 1",
+                    "SELECT id, runtime FROM media WHERE json_extract(external_ids, '$.tmdb') = ? LIMIT 1",
                     (int(media_id),)
                 ).fetchone()
             if not row:
                 continue
 
             remux_media_uuid = row[0]
+            runtime = row[1]  # seconds, may be NULL
             user_row = conn.execute(
                 "SELECT id FROM users ORDER BY is_admin DESC LIMIT 1"
             ).fetchone()
@@ -325,20 +326,28 @@ def update_remux_play_state(items: list[dict]) -> str | None:
 
             if status == "Completed":
                 conn.execute(
-                    "INSERT OR IGNORE INTO user_media_state "
+                    "INSERT INTO user_media_state "
                     "(user_id, media_id, play_count, played_at, last_played_at, playback_position) "
-                    "VALUES (?, ?, 1, ?, ?, 0)",
-                    (user_id, remux_media_uuid, item_time, item_time)
+                    "VALUES (?, ?, 1, ?, ?, ?) "
+                    "ON CONFLICT(user_id, media_id) DO UPDATE SET "
+                    "play_count=1, played_at=excluded.played_at, "
+                    "last_played_at=excluded.last_played_at, playback_position=excluded.playback_position",
+                    (user_id, remux_media_uuid, item_time, item_time, runtime or 0)
                 )
                 log(f"  << {title} → played")
             elif status == "In progress":
+                progress = item.get("progress", 0)
+                position_sec = int(float(progress) * (runtime or 0)) if runtime else 0
                 conn.execute(
-                    "INSERT OR IGNORE INTO user_media_state "
+                    "INSERT INTO user_media_state "
                     "(user_id, media_id, play_count, playback_position, last_played_at) "
-                    "VALUES (?, ?, 0, 0, ?)",
-                    (user_id, remux_media_uuid, item_time)
+                    "VALUES (?, ?, 0, ?, ?) "
+                    "ON CONFLICT(user_id, media_id) DO UPDATE SET "
+                    "playback_position=excluded.playback_position, "
+                    "last_played_at=excluded.last_played_at",
+                    (user_id, remux_media_uuid, position_sec, item_time)
                 )
-                log(f"  << {title} → in progress")
+                log(f"  << {title} → {progress:.0%} ({position_sec}s)")
 
             # Track newest written timestamp for cursor sync
             if changed_at and (newest_ts is None or changed_at > newest_ts):
