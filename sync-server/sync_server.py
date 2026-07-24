@@ -70,7 +70,7 @@ def query_changes(cursor_iso: str, user_token: str) -> list[dict]:
                 FROM app_episode e
                 JOIN app_item i ON i.id = e.item_id
                 JOIN app_season s ON s.id = e.related_season_id
-                JOIN app_tv t ON t.item_id = s.item_id AND t.user_id = ?
+                JOIN app_tv t ON t.id = s.related_tv_id AND t.user_id = ?
                 WHERE t.user_id = ? AND e.end_date IS NOT NULL AND e.end_date > ?
                 ORDER BY e.end_date ASC
                 """, (uid, uid, cursor)
