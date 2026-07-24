@@ -245,16 +245,17 @@ def _query_local(cursor: str) -> list[dict]:
         return []
 
 
-def update_remux_play_state(items: list[dict]) -> None:
-    """Find matching media in Remux DB by TMDB ID and mark as played."""
+def update_remux_play_state(items: list[dict]) -> bool:
+    """Find matching media in Remux DB by TMDB ID and mark as played.
+    Returns True if items were written, False if DB was unwritable."""
     if not items or not Path(REMUX_DB_PATH).exists():
-        return
+        return False
 
     try:
         conn = sqlite3.connect(f"file:{REMUX_DB_PATH}?mode=rw", uri=True, timeout=10)
     except Exception as e:
         log(f"reverse: cannot open Remux DB: {e}", "info")
-        return
+        return False
 
     try:
         for item in items:
@@ -287,7 +288,7 @@ def update_remux_play_state(items: list[dict]) -> None:
                 "SELECT id FROM users ORDER BY is_admin DESC LIMIT 1"
             ).fetchone()
             if not user_row:
-                return
+                return False
 
             user_id = user_row[0]
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -317,8 +318,10 @@ def update_remux_play_state(items: list[dict]) -> None:
         conn.commit()
         if items:
             log(f"reverse: updated {len(items)} item(s) in Remux DB")
+        return True
     except Exception as e:
         log(f"reverse: Remux DB error: {e}", "info")
+        return False
     finally:
         conn.close()
 
@@ -333,11 +336,13 @@ def poll_reverse() -> str | None:
 
     changes = fetch_reverse_changes(cursor)
     if not changes:
-        log("reverse: no changes", "debug")
+        log("reverse: no changes", "info")
         return cursor
 
     log(f"<< {len(changes)} reverse change(s)")
-    update_remux_play_state(changes)
+    if not update_remux_play_state(changes):
+        log("reverse: writes failed — cursor NOT advanced", "info")
+        return cursor
 
     timestamps = [c["changed_at"] for c in changes if c.get("changed_at")]
     if timestamps:
