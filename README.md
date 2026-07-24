@@ -40,12 +40,14 @@ Add to your Yamtrack `docker-compose.yml`:
       YAMTRACK_URL: <your_yamtrack_url>
       YAMTRACK_TOKEN: <yamtrack-user-token>
       YAMTRACK_SYNC_URL: http://yamtrack-sync:8001
+      TMDB_API_KEY: <tmdb-api-key>
       FORWARD_INTERVAL: "30"
       REVERSE_INTERVAL: "60"
     volumes:
-      - ./remux/data:/remux-db:ro
+      - ./remux/data:/remux-db:rw
       - ./bridge-data:/data
     restart: unless-stopped
+    user: root
 ```
 
 ## Environment Variables
@@ -64,6 +66,7 @@ Add to your Yamtrack `docker-compose.yml`:
 | `FORWARD_INTERVAL` | No | `30` | Seconds between forward polls |
 | `REVERSE_INTERVAL` | No | `60` | Seconds between reverse polls |
 | `LOG_LEVEL` | No | `info` | Set to `debug` for verbose logging |
+| `TMDB_API_KEY` | No | — | TMDb API key for auto-importing missing media (free, [get one here](https://www.themoviedb.org/settings/api)) |
 
 ### Sync-server
 
@@ -75,3 +78,17 @@ Add to your Yamtrack `docker-compose.yml`:
 ## Getting your credentials
 
 Both the **Yamtrack token** and **Remux API key** can be found in their respective web UIs.
+
+## TMDb auto-import
+
+When reverse sync encounters a Yamtrack item that doesn't exist in Remux, the bridge can fetch metadata from TMDb and insert the media automatically:
+
+| Marked in Yamtrack | What gets created in Remux |
+|---|---|
+| Movie | Single `movie` row with title, year, runtime, external IDs |
+| TV series | `series` row |
+| TV episode | `series` → `season` → `episode` hierarchy |
+
+Set `TMDB_API_KEY` to enable this. Without it, unknown items are silently skipped (no TMDb calls).
+
+The bridge inserts new media using the same UUID v5 scheme Remux uses internally, so subsequent Remux rescans or addon imports will merge cleanly.
