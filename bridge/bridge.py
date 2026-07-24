@@ -47,6 +47,10 @@ REVERSE_CURSOR: Path = CURSOR_DIR / "reverse_cursor.txt"
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "info").lower()
 DEBUG: bool    = LOG_LEVEL == "debug"
 
+# Per-item dedup: track last-forwarded playback position.
+# Prevents re-forwarding every 30s while user is actively watching.
+_forward_dedup: dict[str, int] = {}
+
 
 def log(msg: str, level: str = "info") -> None:
     if level == "debug" and not DEBUG:
@@ -164,9 +168,26 @@ def poll_forward(user_id: str) -> str | None:
     log(f">> {len(new_items)} new forward item(s)")
     for item in reversed(new_items):
         name = item.get("Name", "?")
-        if item.get("Type") == "Episode":
+        item_type = item.get("Type", "?")
+        if item_type == "Episode":
             name = f"{item.get('SeriesName','?')} S{item.get('ParentIndexNumber','?')}E{item.get('IndexNumber','?')}"
-        log(f"  -> {item.get('Type','?')}: {name}")
+
+        udata = item.get("UserData", {})
+        pos_ticks = udata.get("PlaybackPositionTicks", 0)
+        pos_sec = pos_ticks / 10_000_000
+        played = udata.get("Played", False)
+        last_played = udata.get("LastPlayedDate", "?")
+
+        # Skip if we already forwarded this item at the same position.
+        # While watching, Remux bumps LastPlayedDate every few seconds
+        # even if position hasn't changed meaningfully.
+        item_id = item.get("Id", "")
+        prev_pos = _forward_dedup.get(item_id)
+        if prev_pos is not None and abs(pos_ticks - prev_pos) < 300_000_000:  # <30s
+            continue
+        _forward_dedup[item_id] = pos_ticks
+
+        log(f"  -> {item_type}: {name}  pos={pos_sec:.0f}s  played={played}  ts={last_played}")
         if send_to_yamtrack(build_payload(item)):
             log(f"     OK")
 
