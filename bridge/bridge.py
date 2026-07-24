@@ -245,18 +245,20 @@ def _query_local(cursor: str) -> list[dict]:
         return []
 
 
-def update_remux_play_state(items: list[dict]) -> bool:
+def update_remux_play_state(items: list[dict]) -> str | None:
     """Find matching media in Remux DB by TMDB ID and mark as played.
-    Returns True if items were written, False if DB was unwritable."""
+    Returns the newest written timestamp (ISO format) for cursor sync,
+    or None if nothing was written."""
     if not items or not Path(REMUX_DB_PATH).exists():
-        return False
+        return None
 
     try:
         conn = sqlite3.connect(f"file:{REMUX_DB_PATH}?mode=rw", uri=True, timeout=10)
     except Exception as e:
         log(f"reverse: cannot open Remux DB: {e}", "info")
-        return False
+        return None
 
+    newest_ts: str | None = None
     try:
         for item in items:
             media_id = item.get("media_id")
@@ -288,24 +290,40 @@ def update_remux_play_state(items: list[dict]) -> bool:
                 "SELECT id FROM users ORDER BY is_admin DESC LIMIT 1"
             ).fetchone()
             if not user_row:
-                return False
+                return None
 
             user_id = user_row[0]
 
-            # Use Yamtrack's original timestamp to prevent feedback loop
+            # Parse Yamtrack's changed_at timestamp
             changed_at = item.get("changed_at", "")
+            yamtrack_ts = None
             if changed_at:
                 try:
-                    ts = datetime.fromisoformat(changed_at.replace("Z", "+00:00"))
-                    item_time = ts.strftime("%Y-%m-%d %H:%M:%S")
+                    yamtrack_ts = datetime.fromisoformat(changed_at.replace("Z", "+00:00"))
+                    item_time = yamtrack_ts.strftime("%Y-%m-%d %H:%M:%S")
                 except (ValueError, TypeError):
                     item_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             else:
                 item_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+            # Yamtrack is source of truth: only sync if Remux is behind.
+            # Check if Remux already has a last_played_at >= Yamtrack's changed_at.
+            existing = conn.execute(
+                "SELECT last_played_at FROM user_media_state "
+                "WHERE user_id = ? AND media_id = ?",
+                (user_id, remux_media_uuid)
+            ).fetchone()
+            if existing and existing[0] and yamtrack_ts:
+                try:
+                    remux_ts = datetime.strptime(
+                        existing[0], "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+                    if remux_ts >= yamtrack_ts:
+                        continue  # Remux already in sync or ahead
+                except (ValueError, TypeError):
+                    pass
+
             if status == "Completed":
-                # INSERT only — first sync wins. Prevents feedback loop where
-                # forward→Yamtrack webhooks→reverse re-import→forward again.
                 conn.execute(
                     "INSERT OR IGNORE INTO user_media_state "
                     "(user_id, media_id, play_count, played_at, last_played_at, playback_position) "
@@ -322,13 +340,17 @@ def update_remux_play_state(items: list[dict]) -> bool:
                 )
                 log(f"  << {title} → in progress")
 
+            # Track newest written timestamp for cursor sync
+            if changed_at and (newest_ts is None or changed_at > newest_ts):
+                newest_ts = changed_at
+
         conn.commit()
         if items:
             log(f"reverse: updated {len(items)} item(s) in Remux DB")
-        return True
+        return newest_ts
     except Exception as e:
         log(f"reverse: Remux DB error: {e}", "info")
-        return False
+        return None
     finally:
         conn.close()
 
@@ -347,16 +369,22 @@ def poll_reverse() -> str | None:
         return cursor
 
     log(f"<< {len(changes)} reverse change(s)")
-    if not update_remux_play_state(changes):
-        log("reverse: writes failed — cursor NOT advanced", "info")
+    newest_written = update_remux_play_state(changes)
+    if not newest_written:
+        log("reverse: writes failed or nothing new — cursor NOT advanced", "info")
         return cursor
 
+    # Advance reverse cursor
     timestamps = [c["changed_at"] for c in changes if c.get("changed_at")]
     if timestamps:
         newest = str(max(timestamps))
         save_cursor(REVERSE_CURSOR, newest)
-        return newest
-    return cursor
+
+    # Also bump forward cursor so forward sync skips items we just imported.
+    # Prevents feedback loop: forward→Yamtrack webhook→reverse re-import→forward.
+    save_cursor(FORWARD_CURSOR, newest_written)
+
+    return newest_written
 
 
 # ═══════════════════════════════════════════════════════════════════════════
