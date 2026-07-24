@@ -282,9 +282,20 @@ def update_remux_play_state(items: list[dict]) -> str | None:
     newest_ts: str | None = None
     try:
         for item in items:
-            media_id = item.get("media_id")
-            status   = item.get("status", "")
-            title    = item.get("title", "?")
+            media_id   = item.get("media_id")
+            media_type = item.get("media_type", "")
+            status     = item.get("status", "")
+            title      = item.get("title", "?")
+            season     = item.get("season_number")
+            episode    = item.get("episode_number")
+
+            # Build display name with season/episode for TV content
+            if media_type == "episode" and season is not None and episode is not None:
+                display_name = f"{title} S{season}E{episode}"
+            elif media_type == "season" and season is not None:
+                display_name = f"{title} S{season}"
+            else:
+                display_name = f"{media_type}: {title}" if media_type else title
             if not media_id:
                 continue
 
@@ -355,7 +366,7 @@ def update_remux_play_state(items: list[dict]) -> str | None:
                     "last_played_at=excluded.last_played_at, playback_position=excluded.playback_position",
                     (user_id, remux_media_uuid, item_time, item_time, runtime or 0)
                 )
-                log(f"  << {title} → played")
+                log(f"  << {display_name} → played")
             elif status == "In progress":
                 progress = item.get("progress", 0)
                 position_sec = int(float(progress) * (runtime or 0)) if runtime else 0
@@ -368,7 +379,7 @@ def update_remux_play_state(items: list[dict]) -> str | None:
                     "last_played_at=excluded.last_played_at",
                     (user_id, remux_media_uuid, position_sec, item_time)
                 )
-                log(f"  << {title} → {progress:.0%} ({position_sec}s)")
+                log(f"  << {display_name} → {progress:.0%} ({position_sec}s)")
 
             # Track newest written timestamp for cursor sync
             if changed_at and (newest_ts is None or changed_at > newest_ts):
