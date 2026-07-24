@@ -291,27 +291,34 @@ def update_remux_play_state(items: list[dict]) -> bool:
                 return False
 
             user_id = user_row[0]
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            # Use Yamtrack's original timestamp to prevent feedback loop
+            changed_at = item.get("changed_at", "")
+            if changed_at:
+                try:
+                    ts = datetime.fromisoformat(changed_at.replace("Z", "+00:00"))
+                    item_time = ts.strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    item_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                item_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             if status == "Completed":
+                # INSERT only — first sync wins. Prevents feedback loop where
+                # forward→Yamtrack webhooks→reverse re-import→forward again.
                 conn.execute(
-                    "INSERT INTO user_media_state "
+                    "INSERT OR IGNORE INTO user_media_state "
                     "(user_id, media_id, play_count, played_at, last_played_at, playback_position) "
-                    "VALUES (?, ?, 1, ?, ?, 0) "
-                    "ON CONFLICT(user_id, media_id) DO UPDATE SET "
-                    "play_count = play_count + 1, played_at=excluded.played_at, "
-                    "last_played_at=excluded.last_played_at",
-                    (user_id, remux_media_uuid, now_str, now_str)
+                    "VALUES (?, ?, 1, ?, ?, 0)",
+                    (user_id, remux_media_uuid, item_time, item_time)
                 )
                 log(f"  << {title} → played")
             elif status == "In progress":
                 conn.execute(
-                    "INSERT INTO user_media_state "
+                    "INSERT OR IGNORE INTO user_media_state "
                     "(user_id, media_id, play_count, playback_position, last_played_at) "
-                    "VALUES (?, ?, 0, 0, ?) "
-                    "ON CONFLICT(user_id, media_id) DO UPDATE SET "
-                    "last_played_at=excluded.last_played_at",
-                    (user_id, remux_media_uuid, now_str)
+                    "VALUES (?, ?, 0, 0, ?)",
+                    (user_id, remux_media_uuid, item_time)
                 )
                 log(f"  << {title} → in progress")
 
