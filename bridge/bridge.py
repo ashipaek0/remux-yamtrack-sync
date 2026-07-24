@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -47,9 +48,17 @@ REVERSE_CURSOR: Path = CURSOR_DIR / "reverse_cursor.txt"
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "info").lower()
 DEBUG: bool    = LOG_LEVEL == "debug"
 
+# TMDb API key for fetching metadata when items are missing from Remux.
+# Get a free key at https://www.themoviedb.org/settings/api
+# Leave empty to disable TMDb auto-import.
+TMDB_API_KEY: str = os.environ.get("TMDB_API_KEY", "")
+
 # Per-item dedup: track last-forwarded playback position.
 # Prevents re-forwarding every 30s while user is actively watching.
 _forward_dedup: dict[str, int] = {}
+
+# Remux UUID v5 namespace (DNS namespace — same as Rust's Uuid::new_v5)
+_REMUX_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
 
 def log(msg: str, level: str = "info") -> None:
@@ -179,8 +188,6 @@ def poll_forward(user_id: str) -> str | None:
         last_played = udata.get("LastPlayedDate", "?")
 
         # Skip if we already forwarded this item at the same position.
-        # While watching, Remux bumps LastPlayedDate every few seconds
-        # even if position hasn't changed meaningfully.
         item_id = item.get("Id", "")
         prev_pos = _forward_dedup.get(item_id)
         if prev_pos is not None and abs(pos_ticks - prev_pos) < 300_000_000:  # <30s
@@ -266,6 +273,255 @@ def _query_local(cursor: str) -> list[dict]:
         return []
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# TMDb — fetch metadata for items missing from Remux
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _tmdb_get(path: str) -> dict:
+    """Call the TMDb v3 API."""
+    sep = "&" if "?" in path else "?"
+    url = f"https://api.themoviedb.org/3{path}{sep}api_key={TMDB_API_KEY}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def _remux_uuid(kind: str, canonical: str) -> str:
+    """Replicate Remux's stable UUID: uuid5(DNS_NS, f'{kind}:{canonical}')."""
+    return str(uuid.uuid5(_REMUX_NS, f"{kind}:{canonical}"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _insert_media(conn: sqlite3.Connection, **fields) -> str:
+    """Insert a row into the media table. Returns the UUID."""
+    media_id = fields.pop("id")
+    columns = ", ".join(fields.keys())
+    placeholders = ", ".join("?" for _ in fields)
+    values = list(fields.values())
+    conn.execute(
+        f"INSERT OR IGNORE INTO media (id, {columns}) VALUES (?, {placeholders})",
+        [media_id] + values,
+    )
+    return media_id
+
+
+def _ensure_media_exists(
+    conn: sqlite3.Connection,
+    media_type: str,
+    media_id: str,   # TMDb ID from Yamtrack
+    season: int | None = None,
+    episode: int | None = None,
+) -> str | None:
+    """Fetch metadata from TMDb and insert into Remux media table.
+    Returns the Remux media UUID, or None if the item couldn't be resolved.
+    """
+    if not TMDB_API_KEY:
+        return None
+    try:
+        if media_type == "movie":
+            return _ensure_movie(conn, int(media_id))
+        elif media_type == "episode" and season is not None and episode is not None:
+            return _ensure_episode(conn, int(media_id), season, episode)
+        elif media_type == "season" and season is not None:
+            return _ensure_season(conn, int(media_id), season)
+        elif media_type == "tv":
+            return _ensure_series(conn, int(media_id))
+        else:
+            log(f"  TMDb: unsupported media_type={media_type}", "info")
+            return None
+    except Exception as e:
+        log(f"  TMDb: error for {media_type} {media_id}: {e}", "info")
+        return None
+
+
+def _ensure_movie(conn: sqlite3.Connection, tmdb_id: int) -> str | None:
+    """Fetch movie from TMDb and insert into Remux."""
+    details = _tmdb_get(f"/movie/{tmdb_id}")
+    imdb_id = details.get("imdb_id", "")
+    if not imdb_id:
+        log(f"  TMDb: movie {tmdb_id} has no IMDB ID", "info")
+        return None
+
+    title = details.get("title", "Unknown")
+    runtime = details.get("runtime") or 0  # minutes → seconds
+    runtime_sec = runtime * 60
+    year = details.get("release_date", "")[:4]
+
+    media_uuid = _remux_uuid("movie", imdb_id)
+    external_ids = json.dumps({"tmdb": tmdb_id, "imdb": imdb_id})
+
+    _insert_media(
+        conn,
+        id=media_uuid,
+        title=title,
+        kind="movie",
+        runtime=runtime_sec,
+        external_ids=external_ids,
+        released_at=f"{year}-01-01" if year else None,
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+        enabled=1,
+    )
+    log(f"  + movie: {title} ({year})  tmdb={tmdb_id}")
+    return media_uuid
+
+
+def _ensure_series(conn: sqlite3.Connection, tmdb_id: int) -> str | None:
+    """Fetch TV series from TMDb and insert into Remux."""
+    details = _tmdb_get(f"/tv/{tmdb_id}")
+    external = _tmdb_get(f"/tv/{tmdb_id}/external_ids")
+    imdb_id = external.get("imdb_id", "")
+    if not imdb_id:
+        log(f"  TMDb: series {tmdb_id} has no IMDB ID", "info")
+        return None
+
+    title = details.get("name", "Unknown")
+    year = details.get("first_air_date", "")[:4]
+    external_ids = json.dumps({"tmdb": tmdb_id, "imdb": imdb_id})
+
+    media_uuid = _remux_uuid("series", imdb_id)
+    _insert_media(
+        conn,
+        id=media_uuid,
+        title=title,
+        kind="series",
+        external_ids=external_ids,
+        released_at=f"{year}-01-01" if year else None,
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+        enabled=1,
+    )
+    log(f"  + series: {title} ({year})  tmdb={tmdb_id}")
+    return media_uuid
+
+
+def _ensure_season(
+    conn: sqlite3.Connection, series_tmdb_id: int, season_num: int
+) -> str | None:
+    """Ensure series exists, then insert season. Returns season UUID."""
+    series_uuid = _ensure_series(conn, series_tmdb_id)
+    if not series_uuid:
+        return None
+
+    # Get series IMDB ID for the canonical key
+    row = conn.execute(
+        "SELECT json_extract(external_ids, '$.imdb') FROM media WHERE id=?",
+        (series_uuid,),
+    ).fetchone()
+    series_imdb = row[0] if row else ""
+    if not series_imdb:
+        return None
+
+    canonic = f"{series_imdb}:{season_num}"
+    season_uuid = _remux_uuid("season", canonic)
+
+    # Get series title for season name
+    row = conn.execute("SELECT title FROM media WHERE id=?", (series_uuid,)).fetchone()
+    series_title = row[0] if row else "Unknown"
+
+    external_ids = json.dumps({"tmdb": series_tmdb_id, "imdb": series_imdb})
+    _insert_media(
+        conn,
+        id=season_uuid,
+        title=f"{series_title} Season {season_num}",
+        kind="season",
+        parent_id=series_uuid,
+        grandparent_id=series_uuid,
+        idx=season_num,
+        external_ids=external_ids,
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+        enabled=1,
+    )
+    log(f"  + season: {series_title} S{season_num}")
+    return season_uuid
+
+
+def _ensure_episode(
+    conn: sqlite3.Connection,
+    episode_tmdb_id: int,
+    season_num: int,
+    episode_num: int,
+) -> str | None:
+    """Fetch episode from TMDb, ensure series/season exist, insert episode.
+    Returns the episode's Remux media UUID.
+
+    We need the series TMDb ID, which we get from the TV season endpoint.
+    """
+    # Episode TMDb ID alone doesn't tell us the series. We use the TMDB
+    # episode details which requires series_id. Since we only have the
+    # episode TMDb ID from Yamtrack, we try the /tv/episode/{id} endpoint
+    # with the episode's TMDB ID. If that doesn't work, we try to find
+    # the series via the /find endpoint.
+
+    # Try direct episode lookup
+    try:
+        ep_details = _tmdb_get(f"/tv/episode/{episode_tmdb_id}")
+    except urllib.error.HTTPError:
+        log(f"  TMDb: episode {episode_tmdb_id} not found directly", "info")
+        return None
+
+    series_id = ep_details.get("show_id")
+    if not series_id:
+        log(f"  TMDb: episode {episode_tmdb_id} has no show_id", "info")
+        return None
+
+    # Ensure series exists
+    series_uuid = _ensure_series(conn, series_id)
+    if not series_uuid:
+        return None
+
+    # Ensure season exists
+    season_uuid = _ensure_season(conn, series_id, season_num)
+    if not season_uuid:
+        return None
+
+    # Get series IMDB ID for canonical key
+    row = conn.execute(
+        "SELECT json_extract(external_ids, '$.imdb') FROM media WHERE id=?",
+        (series_uuid,),
+    ).fetchone()
+    series_imdb = row[0] if row else ""
+    if not series_imdb:
+        return None
+
+    canonic = f"{series_imdb}:{season_num}:{episode_num}"
+    episode_uuid = _remux_uuid("episode", canonic)
+
+    title = ep_details.get("name", f"Episode {episode_num}")
+    runtime = ep_details.get("runtime") or 0  # minutes
+    runtime_sec = runtime * 60 if runtime else None
+
+    external_ids = json.dumps({
+        "tmdb": episode_tmdb_id,
+        "imdb": series_imdb,  # episode doesn't have its own IMDB ID
+    })
+
+    _insert_media(
+        conn,
+        id=episode_uuid,
+        title=title,
+        kind="episode",
+        parent_id=season_uuid,
+        grandparent_id=series_uuid,
+        idx=episode_num,
+        parent_idx=season_num,
+        runtime=runtime_sec,
+        external_ids=external_ids,
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+        enabled=1,
+    )
+    return episode_uuid
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REVERSE — apply changes
+# ═══════════════════════════════════════════════════════════════════════════
+
 def update_remux_play_state(items: list[dict]) -> str | None:
     """Find matching media in Remux DB by TMDB ID and mark as played.
     Returns the newest written timestamp (ISO format) for cursor sync,
@@ -315,7 +571,15 @@ def update_remux_play_state(items: list[dict]) -> str | None:
                     (int(media_id),)
                 ).fetchone()
             if not row:
-                continue
+                # Item not in Remux — fetch from TMDb and insert
+                new_uuid = _ensure_media_exists(conn, media_type, media_id, season, episode)
+                if new_uuid:
+                    # Re-read runtime from the newly inserted row
+                    row = conn.execute(
+                        "SELECT id, runtime FROM media WHERE id=?", (new_uuid,)
+                    ).fetchone()
+                if not row:
+                    continue
 
             remux_media_uuid = row[0]
             runtime = row[1]  # seconds, may be NULL
