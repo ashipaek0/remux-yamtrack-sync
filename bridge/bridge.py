@@ -379,21 +379,24 @@ def poll_reverse() -> str | None:
 
     log(f"<< {len(changes)} reverse change(s)")
     newest_written = update_remux_play_state(changes)
-    if not newest_written:
-        log("reverse: writes failed or nothing new — cursor NOT advanced", "info")
-        return cursor
 
-    # Advance reverse cursor
+    # Always advance cursor past the batch, even if nothing matched.
+    # Otherwise unmatched items loop forever.
     timestamps = [c["changed_at"] for c in changes if c.get("changed_at")]
     if timestamps:
         newest = str(max(timestamps))
         save_cursor(REVERSE_CURSOR, newest)
+        # Also bump forward cursor so forward sync skips items we just imported.
+        save_cursor(FORWARD_CURSOR, newest)
+        if newest_written:
+            log(f"reverse: synced, cursor → {newest}")
+        else:
+            log(f"reverse: {len(changes)} items unmatched, cursor → {newest}")
+        return newest
 
-    # Also bump forward cursor so forward sync skips items we just imported.
-    # Prevents feedback loop: forward→Yamtrack webhook→reverse re-import→forward.
-    save_cursor(FORWARD_CURSOR, newest_written)
-
-    return newest_written
+    if not newest_written:
+        log("reverse: no writes and no timestamps — cursor NOT advanced", "info")
+    return cursor
 
 
 # ═══════════════════════════════════════════════════════════════════════════
