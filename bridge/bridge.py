@@ -696,6 +696,86 @@ def poll_reverse() -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# RECONCILIATION — clean up Remux items removed from Yamtrack
+# ═══════════════════════════════════════════════════════════════════════════
+
+_RECONCILE_EVERY_N_TICKS = 60  # ~30 min with 30s forward interval
+
+
+def reconcile_remux() -> int:
+    """Delete user_media_state rows for items no longer tracked in Yamtrack.
+    Returns number of rows deleted."""
+    if not YAMTRACK_SYNC_URL:
+        return 0
+    if not Path(REMUX_DB_PATH).exists():
+        return 0
+
+    # 1. Fetch all tracked media_ids from Yamtrack
+    url = f"{YAMTRACK_SYNC_URL.rstrip('/')}/tracked?token={YAMTRACK_TOKEN}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log(f"reconcile: failed to fetch tracked items: {e}", "info")
+        return 0
+
+    yamtrack_ids = [(item["media_id"], item["media_type"]) for item in data.get("items", [])]
+    log(f"reconcile: Yamtrack has {len(yamtrack_ids)} tracked items")
+
+    if not yamtrack_ids:
+        log("reconcile: Yamtrack has 0 items, skipping (safety)", "info")
+        return 0
+
+    # 2. Resolve to Remux media UUIDs
+    conn = sqlite3.connect(f"file:{REMUX_DB_PATH}?mode=rw", uri=True, timeout=10)
+    try:
+        remux_uuids: list[str] = []
+        for media_id, media_type in yamtrack_ids:
+            # Try TMDb ID match first
+            row = conn.execute(
+                "SELECT id FROM media WHERE json_extract(external_ids, '$.tmdb') = ?",
+                (int(media_id),)
+            ).fetchone()
+            if not row:
+                # Try IMDB ID (some items use tt prefix)
+                row = conn.execute(
+                    "SELECT id FROM media WHERE json_extract(external_ids, '$.imdb') = ?",
+                    (f"tt{media_id}",)
+                ).fetchone()
+            if row:
+                remux_uuids.append(row[0])
+
+        log(f"reconcile: resolved {len(remux_uuids)} UUIDs in Remux")
+
+        if len(remux_uuids) < len(yamtrack_ids) * 0.5:
+            log("reconcile: too few resolved, skipping (safety)", "info")
+            return 0
+
+        # 3. Get the primary user
+        user_row = conn.execute("SELECT id FROM users ORDER BY is_admin DESC LIMIT 1").fetchone()
+        if not user_row:
+            return 0
+        user_id = user_row[0]
+
+        # 4. Delete orphaned rows
+        placeholders = ",".join("?" for _ in remux_uuids)
+        result = conn.execute(
+            f"DELETE FROM user_media_state WHERE user_id = ? AND media_id NOT IN ({placeholders})",
+            [user_id] + remux_uuids
+        )
+        deleted = result.rowcount
+        conn.commit()
+        log(f"reconcile: deleted {deleted} orphaned row(s)")
+        return deleted
+    except Exception as e:
+        log(f"reconcile: error: {e}", "info")
+        return 0
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -738,6 +818,12 @@ def main() -> None:
                 poll_reverse()
             except Exception as e:
                 log(f"REV error: {e}", "info")
+
+        if rev_enabled and tick % _RECONCILE_EVERY_N_TICKS == 0:
+            try:
+                reconcile_remux()
+            except Exception as e:
+                log(f"RECONCILE error: {e}", "info")
 
         time.sleep(FORWARD_INTERVAL)
 

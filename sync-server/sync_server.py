@@ -2,8 +2,10 @@
 """
 yamtrack-sync-server — read-only HTTP shim over Yamtrack SQLite.
 
-Exposes GET /changes?token=<TOKEN>&since=<ISO_TIMESTAMP>
-Returns items with status changes since the cursor.
+Exposes:
+  GET /changes?token=<TOKEN>&since=<ISO_TIMESTAMP>   — items changed since cursor
+  GET /tracked?token=<TOKEN>                          — all currently-tracked media_ids
+  GET /health                                         — health check
 
 Designed to sit alongside Yamtrack's compose, mounting the same ./db volume.
 """
@@ -22,7 +24,6 @@ PORT = int(PORT)
 
 def query_changes(cursor_iso: str, user_token: str) -> list[dict]:
     """Return movies and episodes whose play state changed after cursor_iso."""
-    # Normalize ISO cursor to SQLite format (space instead of T, no Z suffix)
     cursor = cursor_iso.replace("T", " ").replace("Z", "")
 
     rows: list[dict] = []
@@ -113,6 +114,52 @@ def query_changes(cursor_iso: str, user_token: str) -> list[dict]:
     return rows
 
 
+def query_tracked(user_token: str) -> list[dict]:
+    """Return all currently-tracked media_ids for the user."""
+    rows: list[dict] = []
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute
+
+    try:
+        user_row = cur(
+            "SELECT id FROM users_user WHERE token = ?", (user_token,)
+        ).fetchone()
+        if not user_row:
+            return []
+        uid = user_row["id"]
+
+        # Movies
+        for row in cur(
+            "SELECT i.media_id, 'movie' AS media_type FROM app_movie m JOIN app_item i ON i.id = m.item_id WHERE m.user_id = ?",
+            (uid,)
+        ):
+            rows.append({"media_id": row["media_id"], "media_type": row["media_type"]})
+
+        # TV episodes
+        for row in cur(
+            """SELECT i.media_id, 'episode' AS media_type
+               FROM app_episode e
+               JOIN app_item i ON i.id = e.item_id
+               JOIN app_season s ON s.id = e.related_season_id
+               JOIN app_tv t ON t.id = s.related_tv_id
+               WHERE t.user_id = ?""",
+            (uid,)
+        ):
+            rows.append({"media_id": row["media_id"], "media_type": row["media_type"]})
+
+        # TV series
+        for row in cur(
+            "SELECT i.media_id, 'tv' AS media_type FROM app_tv t JOIN app_item i ON i.id = t.item_id WHERE t.user_id = ?",
+            (uid,)
+        ):
+            rows.append({"media_id": row["media_id"], "media_type": row["media_type"]})
+
+    finally:
+        conn.close()
+    return rows
+
+
 class SyncHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -120,6 +167,10 @@ class SyncHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/health":
             self._json({"ok": True})
+            return
+
+        if parsed.path == "/tracked":
+            self._handle_tracked(qs)
             return
 
         if parsed.path != "/changes":
@@ -139,6 +190,17 @@ class SyncHandler(BaseHTTPRequestHandler):
             data = query_changes(since, token)
             cursor = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             self._json({"items": data, "cursor": cursor})
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
+
+    def _handle_tracked(self, qs):
+        token = (qs.get("token") or [None])[0]
+        if not token:
+            self._json({"error": "token required"}, 400)
+            return
+        try:
+            data = query_tracked(token)
+            self._json({"items": data})
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
