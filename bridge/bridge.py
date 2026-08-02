@@ -44,6 +44,7 @@ REVERSE_INTERVAL: int = int(os.environ.get("REVERSE_INTERVAL", "60"))
 CURSOR_DIR: Path     = Path(os.environ.get("CURSOR_DIR", "/data"))
 FORWARD_CURSOR: Path = CURSOR_DIR / "forward_cursor.txt"
 REVERSE_CURSOR: Path = CURSOR_DIR / "reverse_cursor.txt"
+FORWARD_STATE:  Path = CURSOR_DIR / "forward_state.json"   # per-item tracking
 
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "info").lower()
 DEBUG: bool    = LOG_LEVEL == "debug"
@@ -53,9 +54,24 @@ DEBUG: bool    = LOG_LEVEL == "debug"
 # Leave empty to disable TMDb auto-import.
 TMDB_API_KEY: str = os.environ.get("TMDB_API_KEY", "")
 
-# Per-item dedup: track last-forwarded playback position.
-# Prevents re-forwarding every 30s while user is actively watching.
-_forward_dedup: dict[str, int] = {}
+# Per-item forward sync state: persists across restarts so we can
+# detect state transitions (e.g., in-progress → played) even when
+# LastPlayedDate hasn't changed.
+def _load_forward_state() -> dict:
+    """Return {item_id: {last_played, played, pos_ticks}} from disk."""
+    if FORWARD_STATE.exists():
+        try:
+            return json.loads(FORWARD_STATE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_forward_state(state: dict) -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    pruned = {k: v for k, v in state.items() if v.get("last_played", "") >= cutoff}
+    FORWARD_STATE.write_text(json.dumps(pruned))
+
 
 # Remux UUID v5 namespace (DNS namespace — same as Rust's Uuid::new_v5)
 _REMUX_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
@@ -151,6 +167,7 @@ def build_payload(item: dict) -> dict:
 
 def poll_forward(user_id: str) -> str | None:
     cursor = load_cursor(FORWARD_CURSOR)
+    state = _load_forward_state()
     params = (
         f"/Users/{user_id}/Items"
         f"?Recursive=true&SortBy=DatePlayed&SortOrder=Descending"
@@ -160,47 +177,59 @@ def poll_forward(user_id: str) -> str | None:
     items = data.get("Items", []) if isinstance(data, dict) else []
     now   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    new_items: list[dict] = []
+    sent_count = 0
+    newest_ts = cursor or ""
+
     for item in items:
-        last_played = item.get("UserData", {}).get("LastPlayedDate")
+        udata = item.get("UserData", {})
+        last_played = udata.get("LastPlayedDate")
         if not last_played:
             continue
-        if cursor and last_played <= cursor:
-            break
-        new_items.append(item)
 
-    if not new_items:
-        if not cursor:
-            save_cursor(FORWARD_CURSOR, now)
-        return cursor
+        item_id   = item.get("Id", "")
+        played    = udata.get("Played", False)
+        pos_ticks = udata.get("PlaybackPositionTicks", 0)
 
-    log(f">> {len(new_items)} new forward item(s)")
-    for item in reversed(new_items):
+        # Track newest timestamp for cursor
+        if last_played > newest_ts:
+            newest_ts = last_played
+
+        # Check if we need to re-send
+        prev = state.get(item_id, {})
+        prev_played = prev.get("played", False)
+        prev_pos    = prev.get("pos_ticks", 0)
+
+        should_send = False
+        if not prev:
+            should_send = True
+        elif played and not prev_played:
+            # Transitioned to completed — must re-send regardless of cursor
+            should_send = True
+        elif abs(pos_ticks - prev_pos) >= 300_000_000:  # position changed >30s
+            should_send = True
+
+        if not should_send:
+            continue
+
         name = item.get("Name", "?")
         item_type = item.get("Type", "?")
         if item_type == "Episode":
             name = f"{item.get('SeriesName','?')} S{item.get('ParentIndexNumber','?')}E{item.get('IndexNumber','?')}"
 
-        udata = item.get("UserData", {})
-        pos_ticks = udata.get("PlaybackPositionTicks", 0)
         pos_sec = pos_ticks / 10_000_000
-        played = udata.get("Played", False)
-        last_played = udata.get("LastPlayedDate", "?")
-
-        # Skip if we already forwarded this item at the same position.
-        item_id = item.get("Id", "")
-        prev_pos = _forward_dedup.get(item_id)
-        if prev_pos is not None and abs(pos_ticks - prev_pos) < 300_000_000:  # <30s
-            continue
-        _forward_dedup[item_id] = pos_ticks
-
         log(f"  -> {item_type}: {name}  pos={pos_sec:.0f}s  played={played}  ts={last_played}")
         if send_to_yamtrack(build_payload(item)):
             log(f"     OK")
+            state[item_id] = {"last_played": last_played, "played": played, "pos_ticks": pos_ticks}
+            sent_count += 1
 
-    newest = new_items[0]["UserData"]["LastPlayedDate"]
-    save_cursor(FORWARD_CURSOR, newest)
-    return newest
+    if sent_count or not cursor:
+        save_cursor(FORWARD_CURSOR, newest_ts)
+    _save_forward_state(state)
+
+    if sent_count:
+        log(f">> {sent_count} forward item(s) sent")
+    return newest_ts
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -606,19 +635,23 @@ def update_remux_play_state(items: list[dict]) -> str | None:
             # Yamtrack is source of truth: only sync if Remux is behind.
             # Check if Remux already has a last_played_at >= Yamtrack's changed_at.
             existing = conn.execute(
-                "SELECT last_played_at FROM user_media_state "
+                "SELECT play_count, last_played_at FROM user_media_state "
                 "WHERE user_id = ? AND media_id = ?",
                 (user_id, remux_media_uuid)
             ).fetchone()
             if existing and existing[0] and yamtrack_ts:
                 try:
                     remux_ts = datetime.strptime(
-                        existing[0], "%Y-%m-%d %H:%M:%S"
+                        existing[1], "%Y-%m-%d %H:%M:%S"
                     ).replace(tzinfo=timezone.utc)
                     if remux_ts >= yamtrack_ts:
                         continue  # Remux already in sync or ahead
                 except (ValueError, TypeError):
                     pass
+
+            # Safety: never downgrade a completed item in Remux to in-progress
+            if status == "In progress" and existing and existing[0] and existing[0] > 0:
+                continue
 
             if status == "Completed":
                 conn.execute(
