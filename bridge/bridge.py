@@ -661,7 +661,7 @@ def update_remux_play_state(items: list[dict]) -> str | None:
                     "ON CONFLICT(user_id, media_id) DO UPDATE SET "
                     "play_count=1, played_at=excluded.played_at, "
                     "last_played_at=excluded.last_played_at, playback_position=excluded.playback_position",
-                    (user_id, remux_media_uuid, item_time, item_time, runtime or 0)
+                    (user_id, remux_media_uuid, item_time, item_time, 0)
                 )
                 log(f"  << {display_name} → played")
             elif status == "In progress":
